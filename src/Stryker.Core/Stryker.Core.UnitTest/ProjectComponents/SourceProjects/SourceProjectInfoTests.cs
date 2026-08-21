@@ -29,6 +29,26 @@ public class SourceProjectInfoTests : TestBase
     }
 
     [TestMethod]
+    public void ShouldGenerateOutputKindFromCompilerArgumentsWhenOutputTypeIsMissing()
+    {
+        var analyzerResult = TestHelper.SetupProjectAnalyzerResult(
+            properties: new Dictionary<string, string>
+            {
+                { "TargetDir", "/test/bin/Debug/" },
+                { "TargetFileName", "TestName.dll" },
+                { "AssemblyName", "AssemblyName" }
+            },
+            projectFilePath: "/c/project.csproj");
+        analyzerResult.Setup(x => x.CompilerArguments).Returns(["/target:exe"]);
+        analyzerResult.Setup(x => x.CompilerFilePath).Returns("/sdk/csc.dll");
+        var target = new SourceProjectInfo(analyzerResult.Object, null);
+
+        var options = target.AnalyzerResult.GetCompilationOptions();
+
+        options.OutputKind.ShouldBe(OutputKind.ConsoleApplication);
+    }
+
+    [TestMethod]
     [DataRow("Exe", OutputKind.ConsoleApplication)]
     [DataRow("WinExe", OutputKind.WindowsApplication)]
     [DataRow("AppContainerExe", OutputKind.WindowsRuntimeApplication)]

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using Buildalyzer;
 using Microsoft.CodeAnalysis;
@@ -15,7 +16,7 @@ public static class IAnalyzerResultCSharpExtensions
 
     public static CSharpCompilationOptions GetCompilationOptions(this IAnalyzerResult analyzerResult)
     {
-        var compilationOptions = new CSharpCompilationOptions(analyzerResult.GetOutputKind())
+        var compilationOptions = new CSharpCompilationOptions(GetOutputKind(analyzerResult))
             .WithNullableContextOptions(analyzerResult.GetNullableContextOptions())
             .WithAllowUnsafe(analyzerResult.GetPropertyOrDefault("AllowUnsafeBlocks", true))
             .WithAssemblyIdentityComparer(DesktopAssemblyIdentityComparer.Default)
@@ -32,6 +33,20 @@ public static class IAnalyzerResultCSharpExtensions
                 .WithDelaySign(analyzerResult.IsDelayedSignedAssembly());
         }
         return compilationOptions;
+    }
+
+    private static OutputKind GetOutputKind(IAnalyzerResult analyzerResult)
+    {
+        if (analyzerResult.CompilerArguments is not { Length: > 0 } compilerArguments)
+        {
+            return analyzerResult.GetOutputKind();
+        }
+
+        var baseDirectory = Path.GetDirectoryName(analyzerResult.ProjectFilePath);
+        var sdkDirectory = Path.GetDirectoryName(analyzerResult.CompilerFilePath);
+        return CSharpCommandLineParser.Default
+            .Parse(compilerArguments, baseDirectory, sdkDirectory)
+            .CompilationOptions.OutputKind;
     }
 
     public static CSharpParseOptions GetParseOptions(this IAnalyzerResult analyzerResult, IStrykerOptions options) =>
