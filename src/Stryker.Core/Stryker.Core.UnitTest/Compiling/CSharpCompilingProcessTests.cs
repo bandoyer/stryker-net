@@ -551,7 +551,82 @@ public class Calculator
         projectContentsMutants.Count(t => t.ResultStatus == MutantStatus.Pending).ShouldBe(3);
     }
 
-    private static IEnumerable<IMutant> MutateAndCompileSource(string sourceFile)
+    private const string SourceWithConfigurationLambda = @"using System;
+
+namespace ExampleProject
+{
+public class Options
+{
+    public int Retries { get; set; }
+}
+
+public class Startup
+{
+    public static void Configure(Action<Options> configure) => configure(new Options());
+
+    public void Run()
+    {
+        Configure(options =>
+        {
+            options.Retries = 3;
+        });
+    }
+}
+}";
+
+    [TestMethod]
+    public void ShouldRollbackMutationsThatASourceGeneratorCanNotRead()
+    {
+        var (mutants, assembly) = MutateAndCompile(SourceWithConfigurationLambda,
+            [typeof(ConfigurationReadingGenerator).Assembly.Location]);
+
+        // the generator read the lambda again once the mutation inside it was gone
+        Assembly.Load(assembly).GetType("ExampleProject.GeneratedConfiguration")!
+            .GetProperty("Understood")!.GetValue(null).ShouldBe(true);
+        var rolledBack = mutants.Where(mutant => mutant.ResultStatus == MutantStatus.CompileError).ToList();
+        rolledBack.ShouldNotBeEmpty();
+        rolledBack.ShouldAllBe(mutant => mutant.Mutation.OriginalNode.ToString().Contains("options.Retries"));
+        mutants.ShouldContain(mutant => mutant.ResultStatus == MutantStatus.Pending);
+    }
+
+    [TestMethod]
+    public void ShouldFailWhenASourceGeneratorErrorCanNotBeRolledBack()
+    {
+        var original = CSharpSyntaxTree.ParseText(SourceWithConfigurationLambda);
+        var mutated = CSharpSyntaxTree.ParseText(SourceWithConfigurationLambda.Replace(
+            "options.Retries = 3;", "if (Environment.TickCount == 0) {} else { options.Retries = 3; }"));
+        var input = new MutationTestInput
+        {
+            SourceProjectInfo = new SourceProjectInfo(TestHelper.SetupProjectAnalyzerResult(
+                projectFilePath: "/c/project.csproj",
+                properties: new Dictionary<string, string>
+                {
+                    { "TargetDir", "" },
+                    { "AssemblyName", "AssemblyName" },
+                    { "TargetFileName", "TargetFileName.dll" },
+                },
+                references: [typeof(object).Assembly.Location, Assembly.Load("System.Runtime").Location],
+                analyzers: [typeof(ConfigurationReadingGenerator).Assembly.Location]
+            ).Object, null)
+        };
+        var rollbackProcessMock = new Mock<ICSharpRollbackProcess>(MockBehavior.Strict);
+        rollbackProcessMock.Setup(x => x.RollbackMutationsInError(It.IsAny<ICompilationContent>(),
+                It.Is<ImmutableArray<Diagnostic>>(errors => errors.Single().Id == ConfigurationReadingGenerator.ErrorId),
+                ICSharpRollbackProcess.Mode.Normal, false))
+            .Returns((IEnumerable<int>)null);
+        var target = new CsharpCompilingProcess(input, rollbackProcessMock.Object, syntaxTrees: [original]);
+        // the generators first run on the code as written, where they report nothing
+        target.GetSemanticModel(original);
+        target.ReplaceSyntaxTree(original, mutated);
+
+        using var ms = new MemoryStream();
+        Should.Throw<CompilationException>(() => target.Compile(ms, null)).Message.ShouldBe("Source Generator Failure");
+        rollbackProcessMock.VerifyAll();
+    }
+
+    private static IEnumerable<IMutant> MutateAndCompileSource(string sourceFile) => MutateAndCompile(sourceFile).Mutants;
+
+    private static (IEnumerable<IMutant> Mutants, byte[] Assembly) MutateAndCompile(string sourceFile, string[] analyzers = null)
     {
         var filesystemRoot = Path.GetPathRoot(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location));
 
@@ -601,7 +676,8 @@ public class Calculator
                         typeof(System.IO.MemoryMappedFiles.MemoryMappedFile).Assembly.Location,
                         Assembly.Load("System.Runtime").Location,
                         Assembly.Load("System.Runtime.InteropServices").Location
-                    ]
+                    ],
+                    analyzers: analyzers
                 ).Object,
                 new TestProjectsInfo(fileSystem)
                 {
@@ -642,6 +718,7 @@ public class Calculator
         process.Mutate(input, options);
 
         var projectContentsMutants = input.SourceProjectInfo.ProjectContents.Mutants;
-        return projectContentsMutants;
+        var injectedAssembly = fileSystem.AllFiles.First(file => file.EndsWith("TargetFileName.dll"));
+        return (projectContentsMutants, fileSystem.File.ReadAllBytes(injectedAssembly));
     }
 }

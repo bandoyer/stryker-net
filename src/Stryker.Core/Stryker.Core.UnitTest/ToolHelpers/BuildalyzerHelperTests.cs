@@ -75,7 +75,8 @@ public class BuildalyzerHelperTests : TestBase
     {
         var projectAnalyzerResult = TestHelper.SetupProjectAnalyzerResult(
             properties: new Dictionary<string, string>(),
-            projectFilePath: "path", analyzers: [Assembly.GetExecutingAssembly().Location]).Object;
+            // an assembly that holds no analyzer or generator; this test assembly holds a generator for the compiling tests
+            projectFilePath: "path", analyzers: [typeof(Mock).Assembly.Location]).Object;
 
         var logger = new Mock<ILogger>(MockBehavior.Loose);
 

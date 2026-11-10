@@ -216,7 +216,7 @@ internal class MutationStore
             store.Select(m => (m, ((StatementSyntax)sourceNode).InjectMutation(m.Mutation))));
         store.Clear();
 
-        return result as BlockSyntax ?? SyntaxFactory.Block(result);
+        return result as BlockSyntax ?? MutantPlacer.HostBlock(result);
     }
 
     /// <summary>
@@ -242,7 +242,7 @@ internal class MutationStore
         var result = _mutantPlacer.PlaceStatementControlledMutations(mutatedNode,
             blockStore.Store.Select(m => (m, wrapper(originalNode.InjectMutation(m.Mutation)))));
         blockStore.Store.Clear();
-        return result as BlockSyntax ?? SyntaxFactory.Block(result);
+        return result as BlockSyntax ?? MutantPlacer.HostBlock(result);
     }
 
     private sealed class PendingMutations

@@ -36,6 +36,7 @@ public interface ICSharpCompilingProcess
 public class CsharpCompilingProcess : ICSharpCompilingProcess, ICompilationContent
 {
     private const int MaxAttempt = 50;
+    private const int MaxGeneratorRollbackAttempts = 10;
     private readonly MutationTestInput _input;
     private readonly IStrykerOptions _options;
     private readonly ICSharpRollbackProcess _rollbackProcess;
@@ -44,6 +45,9 @@ public class CsharpCompilingProcess : ICSharpCompilingProcess, ICompilationConte
     private Compilation _compilation;
     private readonly IEnumerable<SyntaxTree> _originalSyntaxTrees;
     private bool _needToRunGenerators;
+    // Ids of the errors the generators report before any mutation is in place. Null until the generators ran once.
+    private HashSet<string> _generatorErrorIdsBeforeMutation;
+    private readonly HashSet<int> _rolledBackForGenerators = [];
 
     public CsharpCompilingProcess(MutationTestInput input,
         ICSharpRollbackProcess rollbackProcess = null,
@@ -74,7 +78,7 @@ public class CsharpCompilingProcess : ICSharpCompilingProcess, ICompilationConte
         {
             return new CompilingProcessResult(
                 true,
-                rollbackProcessResult ?? []);
+                (rollbackProcessResult ?? []).Union(_rolledBackForGenerators).ToList());
         }
 
         // compiling failed
@@ -156,26 +160,65 @@ public class CsharpCompilingProcess : ICSharpCompilingProcess, ICompilationConte
         return _compilation.GetSemanticModel(syntaxTree);
     }
 
-    // Can't test or mock code generators, so we exclude them from coverage
-    [ExcludeFromCodeCoverage]
     private void RunSourceGenerators()
     {
-        if (!_needToRunGenerators)
+        for (var attempt = 1; _needToRunGenerators; attempt++)
         {
-            return;
+            _generatorDriver = _generatorDriver.RunGeneratorsAndUpdateCompilation(_compilation.RemoveSyntaxTrees(GeneratedTrees)
+                , out _compilation, out var diagnostics);
+            _needToRunGenerators = false;
+            var errors = diagnostics.Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error).ToList();
+            var generalErrors = errors.Where(diagnostic => diagnostic.Location == Location.None).ToList();
+            if (generalErrors.Count > 0)
+            {
+                _logger.LogError("Failed to generate source code for mutated assembly, errors are: {Diagnostics}",
+                    string.Join(Environment.NewLine, generalErrors.Select(e => e.ToString())));
+                throw new CompilationException("Source Generator Failure");
+            }
+
+            if (_generatorErrorIdsBeforeMutation == null)
+            {
+                // The first run sees the code before any mutation is placed, so these errors are the project's own
+                _generatorErrorIdsBeforeMutation = errors.Select(error => error.Id).ToHashSet();
+                return;
+            }
+
+            var causedByMutations = errors.Where(IsCausedByMutation).ToImmutableArray();
+            if (!causedByMutations.IsEmpty)
+            {
+                RollbackMutationsBreakingGenerators(causedByMutations, attempt);
+            }
+        }
+    }
+
+    private bool IsCausedByMutation(Diagnostic error) =>
+        !_generatorErrorIdsBeforeMutation.Contains(error.Id)
+        && error.Location.SourceTree is { } tree
+        && _compilation.ContainsSyntaxTree(tree);
+
+    /// <summary>
+    /// A generator that reads source as syntax, such as one that parses a configuration lambda, can reject mutated
+    /// code and emit a fallback instead of failing the build. The assembly then compiles but behaves differently
+    /// with no mutation active, so the mutations at the reported locations are removed like any that fail to compile.
+    /// </summary>
+    private void RollbackMutationsBreakingGenerators(ImmutableArray<Diagnostic> errors, int attempt)
+    {
+        var description = string.Join(Environment.NewLine, errors.Select(e => e.ToString()));
+        _logger.LogDebug("Source generator errors caused by mutations: {Diagnostics}", description);
+
+        var rolledBack = attempt > MaxGeneratorRollbackAttempts
+            ? null
+            : _rollbackProcess.RollbackMutationsInError(this, errors, ICSharpRollbackProcess.Mode.Normal, _options.DiagMode);
+        // a rollback that replaced no syntax tree would leave the same errors in place
+        if (rolledBack == null || !_needToRunGenerators)
+        {
+            _logger.LogError(
+                "A source generator fails on the mutated code and Stryker could not remove the mutations that cause it. Errors are: {Diagnostics}",
+                description);
+            throw new CompilationException("Source Generator Failure");
         }
 
-        _generatorDriver = _generatorDriver.RunGeneratorsAndUpdateCompilation(_compilation.RemoveSyntaxTrees(GeneratedTrees)
-            , out _compilation, out var diagnostics);
-        _needToRunGenerators = false;
-        var errors = diagnostics.Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error && diagnostic.Location == Location.None).ToList();
-        if (errors.Count == 0)
-        {
-            return;
-        }
-        _logger.LogError("Failed to generate source code for mutated assembly, errors are: {Diagnostics}",
-            string.Join(Environment.NewLine, errors.Select(e => e.ToString())));
-        throw new CompilationException("Source Generator Failure");
+        _rolledBackForGenerators.UnionWith(rolledBack);
     }
 
     private void InitCSharpCompilation(IEnumerable<SyntaxTree> originalSyntaxTrees)
