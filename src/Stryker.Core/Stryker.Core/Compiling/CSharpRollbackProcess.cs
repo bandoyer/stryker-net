@@ -200,7 +200,10 @@ public class CSharpRollbackProcess : ICSharpRollbackProcess
                 RollBackedIds.Add(info.Id.Value);
             }
             // remove the mutated node using its MutantPlacer remove method and update the tree
-            trackedTree = trackedTree.ReplaceNode(nodeToRemove, MutantPlacer.RemoveMutant(nodeToRemove));
+            var restoredNode = MutantPlacer.RemoveMutant(nodeToRemove);
+            trackedTree = MutantPlacer.RemoveHostBlock(nodeToRemove, restoredNode) is { } hosted
+                ? trackedTree.ReplaceNode(hosted.host, hosted.restored)
+                : trackedTree.ReplaceNode(nodeToRemove, restoredNode);
         }
 
         return trackedTree;

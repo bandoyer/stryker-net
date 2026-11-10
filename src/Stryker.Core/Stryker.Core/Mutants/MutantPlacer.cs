@@ -21,6 +21,7 @@ public class MutantPlacer(CodeInjection injection)
 
     private static readonly Dictionary<string, (IInstrumentCode engine, SyntaxAnnotation annotation)> InstrumentEngines = [];
     private static readonly HashSet<string> RequireRecursiveRemoval = [];
+    private static readonly SyntaxAnnotation HostBlockMarker = new("StrykerHostBlock");
 
     private static readonly StaticInstrumentationEngine StaticEngine = new();
     private static readonly StaticInitializerMarkerEngine StaticInitializerEngine = new();
@@ -98,6 +99,29 @@ public class MutantPlacer(CodeInjection injection)
     /// <remarks>return <paramref name="block"/> if there is no 'out' parameter.</remarks>
     public static BlockSyntax InjectOutParametersInitialization(BlockSyntax block, IEnumerable<ParameterSyntax> parameters) =>
         DefaultInitializationEngine.InjectOutParametersInitialization(block, parameters);
+
+    /// <summary>
+    /// Wraps the if statement that controls a mutated block in a block of its own, where the syntax requires a block.
+    /// </summary>
+    /// <param name="controlledBlock">the if statement (or chain of if statements) holding the mutated block</param>
+    /// <returns>a block that <see cref="RemoveHostBlock"/> recognizes</returns>
+    public static BlockSyntax HostBlock(StatementSyntax controlledBlock) =>
+        SyntaxFactory.Block(controlledBlock).WithAdditionalAnnotations(HostBlockMarker);
+
+    /// <summary>
+    /// Gives the block to put back in place of a host block once the last mutation in it is removed. Leaving the
+    /// restored block inside its host would compile, but as <c>{ { ... } }</c>, which is not the code as written:
+    /// a source generator that reads the block as syntax rejects it as it rejects the mutation.
+    /// </summary>
+    /// <param name="removedMutation">the mutation being removed, as found in the tree</param>
+    /// <param name="restoredNode">what <see cref="RemoveMutant"/> returned for it</param>
+    /// <returns>the host block to replace and its replacement, or null when the mutation is not alone in a host block</returns>
+    public static (BlockSyntax host, BlockSyntax restored)? RemoveHostBlock(SyntaxNode removedMutation, SyntaxNode restoredNode) =>
+        restoredNode is BlockSyntax restoredBlock
+        && removedMutation.Parent is BlockSyntax { Statements.Count: 1 } host
+        && host.HasAnnotation(HostBlockMarker)
+            ? (host, restoredBlock.WithTriviaFrom(host))
+            : null;
 
     /// <summary>
     /// Add one or more mutations controlled via one or more if statements
