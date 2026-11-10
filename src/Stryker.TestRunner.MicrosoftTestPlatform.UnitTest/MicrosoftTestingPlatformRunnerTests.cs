@@ -440,7 +440,7 @@ public class MicrosoftTestingPlatformRunnerTests
     }
 
     [TestMethod, Timeout(1000)]
-    public void CalculateAssemblyTimeout_UsesOnlyTheTestsCoveringTheMutant()
+    public void CalculateAssemblyTimeout_BudgetsTheWholeAssembly_WhateverTestsCoverTheMutant()
     {
         var test1 = new TestNode("uid-1", "Test1", "test", "passed");
         var test2 = new TestNode("uid-2", "Test2", "test", "passed");
@@ -454,10 +454,9 @@ public class MicrosoftTestingPlatformRunnerTests
         desc2.RegisterInitialTestResult(new MtpTestResult(TimeSpan.FromMilliseconds(200)));
         _testDescriptions["uid-2"] = desc2;
 
-        // Mutant is only covered by test1, so only its 100ms should be used, not the full 300ms.
-        var mutant = new Mock<IMutant>();
-        mutant.SetupGet(m => m.AssessingTests).Returns(new TestIdentifierList("uid-1"));
-
+        // A mutant runs on a test host of its own. The host pays again for what the tests share, such as the
+        // start of an application they build once per process, and a test's initial run time is only its share
+        // of the whole run. So the run of one 100ms test is given the 300ms the whole assembly took.
         int capturedEstimate = -1;
         var timeoutCalc = new Mock<ITimeoutValueCalculator>();
         timeoutCalc.Setup(x => x.CalculateTimeoutValue(It.IsAny<int>()))
@@ -466,81 +465,89 @@ public class MicrosoftTestingPlatformRunnerTests
 
         using var runner = CreateRunner();
 
-        runner.CalculateAssemblyTimeout(discoveredTests, timeoutCalc.Object, "test.dll", new[] { mutant.Object });
-
-        capturedEstimate.ShouldBe(100);
-    }
-
-    [TestMethod, Timeout(1000)]
-    public void CalculateAssemblyTimeout_UsesUnionOfTestsCoveringGroupedMutants()
-    {
-        var test1 = new TestNode("uid-1", "Test1", "test", "passed");
-        var test2 = new TestNode("uid-2", "Test2", "test", "passed");
-        var test3 = new TestNode("uid-3", "Test3", "test", "passed");
-        var discoveredTests = new List<TestNode> { test1, test2, test3 };
-
-        var desc1 = new MtpTestDescription(test1);
-        desc1.RegisterInitialTestResult(new MtpTestResult(TimeSpan.FromMilliseconds(100)));
-        _testDescriptions["uid-1"] = desc1;
-
-        var desc2 = new MtpTestDescription(test2);
-        desc2.RegisterInitialTestResult(new MtpTestResult(TimeSpan.FromMilliseconds(200)));
-        _testDescriptions["uid-2"] = desc2;
-
-        var desc3 = new MtpTestDescription(test3);
-        desc3.RegisterInitialTestResult(new MtpTestResult(TimeSpan.FromMilliseconds(400)));
-        _testDescriptions["uid-3"] = desc3;
-
-        // Two grouped mutants with disjoint covering tests. The run executes the union of their
-        // covering tests (uid-1 + uid-2 = 300ms), not the uncovered uid-3.
-        var mutant1 = new Mock<IMutant>();
-        mutant1.SetupGet(m => m.AssessingTests).Returns(new TestIdentifierList("uid-1"));
-        var mutant2 = new Mock<IMutant>();
-        mutant2.SetupGet(m => m.AssessingTests).Returns(new TestIdentifierList("uid-2"));
-
-        int capturedEstimate = -1;
-        var timeoutCalc = new Mock<ITimeoutValueCalculator>();
-        timeoutCalc.Setup(x => x.CalculateTimeoutValue(It.IsAny<int>()))
-            .Callback<int>(ms => capturedEstimate = ms)
-            .Returns(999);
-
-        using var runner = CreateRunner();
-
-        runner.CalculateAssemblyTimeout(discoveredTests, timeoutCalc.Object, "test.dll",
-            new[] { mutant1.Object, mutant2.Object });
+        runner.CalculateAssemblyTimeout(discoveredTests, timeoutCalc.Object, "test.dll");
 
         capturedEstimate.ShouldBe(300);
     }
 
-    [TestMethod, Timeout(1000)]
-    public void CalculateAssemblyTimeout_FallsBackToFullRun_WhenMutantAssessesEveryTest()
+    [TestMethod, Timeout(5000)]
+    public async Task RunAssemblyTestsInternalAsync_ReplacesAWarmHost_WhenAMutantIsUnderTest()
     {
-        var test1 = new TestNode("uid-1", "Test1", "test", "passed");
-        var test2 = new TestNode("uid-2", "Test2", "test", "passed");
-        var discoveredTests = new List<TestNode> { test1, test2 };
-
-        var desc1 = new MtpTestDescription(test1);
-        desc1.RegisterInitialTestResult(new MtpTestResult(TimeSpan.FromMilliseconds(100)));
-        _testDescriptions["uid-1"] = desc1;
-
-        var desc2 = new MtpTestDescription(test2);
-        desc2.RegisterInitialTestResult(new MtpTestResult(TimeSpan.FromMilliseconds(200)));
-        _testDescriptions["uid-2"] = desc2;
-
-        var mutant = new Mock<IMutant>();
-        mutant.SetupGet(m => m.AssessingTests).Returns(TestIdentifierList.EveryTest());
-
-        int capturedEstimate = -1;
-        var timeoutCalc = new Mock<ITimeoutValueCalculator>();
-        timeoutCalc.Setup(x => x.CalculateTimeoutValue(It.IsAny<int>()))
-            .Callback<int>(ms => capturedEstimate = ms)
-            .Returns(999);
-
+        // The warm host already ran tests. Code that runs once per process ran on it before the mutant was
+        // active, and an earlier mutant may have left it broken, so the mutant can not be judged on it.
+        const string assembly = "/nonexistent/assembly.dll";
         using var runner = CreateRunner();
+        var (client, processHandle) = await AddWarmServerAsync(runner, assembly);
 
-        runner.CalculateAssemblyTimeout(discoveredTests, timeoutCalc.Object, "test.dll", new[] { mutant.Object });
+        // no host can start for an assembly that does not exist, so the run itself fails
+        var (result, _) = await runner.RunAssemblyTestsInternalAsync(assembly, testUidFilter: null, timeout: null, onFreshHost: true);
 
-        capturedEstimate.ShouldBe(300);
+        processHandle.Verify(x => x.Kill(), Times.Once);
+        client.Verify(x => x.RunTestsAsync(It.IsAny<Func<TestNodeUpdate[], Task>>(), It.IsAny<TestNode[]?>(), It.IsAny<CancellationToken>()), Times.Never);
+        runner._assemblyServers.ShouldNotContainKey(assembly);
+        result.FailingTests.IsEveryTest.ShouldBeTrue();
+    }
+
+    [TestMethod, Timeout(5000)]
+    public async Task RunAssemblyTestsInternalAsync_KeepsAWarmHost_WhenNoMutantIsUnderTest()
+    {
+        const string assembly = "/nonexistent/assembly.dll";
+        using var runner = CreateRunner();
+        var (client, processHandle) = await AddWarmServerAsync(runner, assembly);
+
+        await runner.RunAssemblyTestsInternalAsync(assembly, testUidFilter: null);
+
+        processHandle.Verify(x => x.Kill(), Times.Never);
+        client.Verify(x => x.RunTestsAsync(It.IsAny<Func<TestNodeUpdate[], Task>>(), It.IsAny<TestNode[]?>(), It.IsAny<CancellationToken>()), Times.Once);
+        runner._assemblyServers.ShouldContainKey(assembly);
+    }
+
+    [TestMethod, Timeout(1000)]
+    public async Task RunAllTestsAsync_LeavesOutFailuresOfTestsThatFailWithNoMutationActive_WhenAMutantIsUnderTest()
+    {
+        const string assembly = "/path/to/tests.dll";
+        var failingBoth = new TestRunResult([], TestIdentifierList.EveryTest(), new TestIdentifierList(new[] { "broken", "killer" }),
+            TestIdentifierList.NoTest(), string.Empty, [], TimeSpan.FromMilliseconds(1));
+        var perAssembly = new Dictionary<string, (TestRunResult Result, List<TestNode> Discovered)>
+        {
+            [assembly] = (failingBoth, [new TestNode("broken", "Broken", "test", "failed"), new TestNode("killer", "Killer", "test", "failed")]),
+        };
+        using var runner = new StubbedAssemblyRunner(_testsByAssembly, _testDescriptions, _testSet, _discoveryLock, perAssembly);
+        // "broken" fails on the mutated assembly whatever mutant is active, so its failure says nothing
+        runner.IgnoreFailuresOf(new HashSet<string> { "broken" });
+        var mutant = MockMutant(1, new TestIdentifierList(new[] { "broken", "killer" }));
+
+        var underMutant = await runner.RunAllTestsAsync([assembly], mutantId: 1, mutants: [mutant.Object], update: null);
+        var withoutMutant = await runner.RunAllTestsAsync([assembly], mutantId: -1, mutants: null, update: null);
+
+        underMutant.FailingTests.GetIdentifiers().ShouldBe(["killer"]);
+        withoutMutant.FailingTests.GetIdentifiers().ShouldBe(["broken", "killer"], ignoreOrder: true);
+    }
+
+    /// <summary>
+    /// Gives the runner a started test host for the assembly, as left behind by an earlier run.
+    /// </summary>
+    private static async Task<(Mock<ITestingPlatformClient> Client, Mock<IProcessHandle> ProcessHandle)> AddWarmServerAsync(
+        MicrosoftTestingPlatformRunner runner, string assembly)
+    {
+        var client = new Mock<ITestingPlatformClient>();
+        client.Setup(x => x.InitializeAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        client.Setup(x => x.ExitAsync(true)).Returns(Task.CompletedTask);
+        client.Setup(x => x.WaitServerProcessExitAsync()).ReturnsAsync(0);
+        var processHandle = new Mock<IProcessHandle>();
+        var process = new Mock<ITestServerProcess>();
+        process.Setup(x => x.WaitForExitAsync()).Returns(new TaskCompletionSource().Task);
+        process.Setup(x => x.ProcessHandle).Returns(processHandle.Object);
+        var listener = new Mock<ITestServerListener>();
+        listener.Setup(x => x.AcceptConnectionAsync(It.IsAny<CancellationToken>())).ReturnsAsync(new TcpClient());
+        var factory = new Mock<ITestServerConnectionFactory>();
+        factory.Setup(x => x.CreateListener()).Returns((listener.Object, 12345));
+        factory.Setup(x => x.StartProcess(assembly, 12345, It.IsAny<Dictionary<string, string?>>())).Returns(process.Object);
+        factory.Setup(x => x.CreateClient(It.IsAny<TcpClient>(), It.IsAny<IProcessHandle>(), It.IsAny<ILogger>())).Returns(client.Object);
+        var server = new AssemblyTestServer(assembly, [], NullLogger.Instance, "test-runner", connectionFactory: factory.Object);
+        await server.StartAsync();
+        runner._assemblyServers[assembly] = server;
+        return (client, processHandle);
     }
 
     [TestMethod, Timeout(1000)]

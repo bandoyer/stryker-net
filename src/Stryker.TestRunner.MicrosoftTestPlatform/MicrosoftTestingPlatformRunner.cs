@@ -47,6 +47,9 @@ public class MicrosoftTestingPlatformRunner : IDisposable
     private readonly object _serverLock = new();
     private readonly HashSet<string> _initializedPerTestFiles = new();
     private readonly Dictionary<string, int> _perTestEpochCounters = new();
+    private readonly Dictionary<string, OncePerProcessCoverage> _oncePerProcessCoverage = new();
+    private readonly ConcurrentDictionary<string, byte> _testsFailedDuringCoverage = new();
+    private IReadOnlySet<string> _testsFailingWithoutMutation = new HashSet<string>();
 
     private TestCaseFilterExpression? _strykerSideFilter;
 
@@ -62,6 +65,55 @@ public class MicrosoftTestingPlatformRunner : IDisposable
     /// Path of the mutant-id control file this runner shares with its test hosts. Exposed for unit testing.
     /// </summary>
     internal string MutantFilePath => _mutantFilePath;
+
+    /// <summary>
+    /// The tests that ended in a failure while this runner captured coverage, when no mutation is active.
+    /// </summary>
+    internal IReadOnlyCollection<string> TestsFailedDuringCoverage => _testsFailedDuringCoverage.Keys.ToList();
+
+    /// <summary>
+    /// Records that a test failed while coverage was captured. Exposed for unit testing.
+    /// </summary>
+    internal void RecordTestFailedDuringCoverage(string testId) => _testsFailedDuringCoverage[testId] = 0;
+
+    /// <summary>
+    /// The mutants this runner saw covered only once per test host of <paramref name="assembly"/>,
+    /// see <see cref="OncePerProcessCoverage"/>.
+    /// </summary>
+    internal IReadOnlyCollection<int> MutantsCoveredOncePerProcess(string assembly)
+    {
+        lock (_serverLock)
+        {
+            return _oncePerProcessCoverage.TryGetValue(assembly, out var coverage) ? coverage.Mutants.ToList() : [];
+        }
+    }
+
+    /// <summary>
+    /// Stops the given tests from killing mutants. They fail with no mutation active, so their failure says
+    /// nothing about a mutant.
+    /// </summary>
+    internal void IgnoreFailuresOf(IReadOnlySet<string> tests) => _testsFailingWithoutMutation = tests;
+
+    /// <summary>
+    /// The tests whose failures this runner leaves out of a mutant's result. Exposed for unit testing.
+    /// </summary>
+    internal IReadOnlySet<string> TestsFailingWithoutMutation => _testsFailingWithoutMutation;
+
+    /// <summary>
+    /// What this runner knows about the coverage that depends on the state of a test host of <paramref name="assembly"/>.
+    /// </summary>
+    internal OncePerProcessCoverage OncePerProcessCoverageOf(string assembly)
+    {
+        lock (_serverLock)
+        {
+            if (!_oncePerProcessCoverage.TryGetValue(assembly, out var coverage))
+            {
+                _oncePerProcessCoverage[assembly] = coverage = new OncePerProcessCoverage();
+            }
+
+            return coverage;
+        }
+    }
 
     public MicrosoftTestingPlatformRunner(
         int id,
@@ -667,38 +719,15 @@ public class MicrosoftTestingPlatformRunner : IDisposable
             try
             {
                 var server = await GetOrCreateServerAsync(assembly).ConfigureAwait(false);
-                var (_, timedOut) = await server.RunTestsAsync(new[] { test }, CalculateSingleTestTimeout(test)).ConfigureAwait(false);
-                if (timedOut)
+                var coverage = await RunTestAndRelayCoverageAsync(server, assembly, test, testId).ConfigureAwait(false);
+                if (coverage is null)
                 {
-                    _logger.LogWarning(
-                        "{RunnerId}: Test run timed out while capturing per-test coverage for {TestId}; marking as Dubious",
-                        RunnerId, testId);
-                    await DiscardServerAsync(assembly).ConfigureAwait(false);
                     return CoverageRunResult.Create(testId, CoverageConfidence.Dubious,
                         Array.Empty<int>(), Array.Empty<int>(), Array.Empty<int>());
                 }
 
-                int epoch;
-                lock (_serverLock)
-                {
-                    _perTestEpochCounters.TryGetValue(assembly, out var current);
-                    epoch = current + 1;
-                    _perTestEpochCounters[assembly] = epoch;
-                }
-
-                var requestedRelays = BroadcastEpochRequest(epochFilePath, epoch);
-
-                var acked = await WaitForAllEpochAcksAsync(requestedRelays, epoch, TimeSpan.FromSeconds(10)).ConfigureAwait(false);
-                if (!acked)
-                {
-                    _logger.LogWarning(
-                        "{RunnerId}: Timed out waiting for coverage relay ack for test {TestId}; marking as Dubious",
-                        RunnerId, testId);
-                    return CoverageRunResult.Create(testId, CoverageConfidence.Dubious,
-                        Array.Empty<int>(), Array.Empty<int>(), Array.Empty<int>());
-                }
-
-                var (covered, staticMutants) = ReadCoverageForHandedOutPath(coverageFilePath);
+                var (covered, staticMutants) = coverage.Value;
+                await FindCoverageThatDependsOnTheHostAsync(server, assembly, test, testId, covered).ConfigureAwait(false);
                 return CoverageRunResult.Create(testId, CoverageConfidence.Normal, covered, staticMutants, Array.Empty<int>());
             }
             catch (Exception ex)
@@ -719,6 +748,84 @@ public class MicrosoftTestingPlatformRunner : IDisposable
             RunnerId, testId, maxRunAttempts);
         return CoverageRunResult.Create(testId, CoverageConfidence.Dubious,
             Array.Empty<int>(), Array.Empty<int>(), Array.Empty<int>());
+    }
+
+    /// <summary>
+    /// Runs one test on a warm host, then has the injected <see cref="MutantControl"/> flush what the test covered.
+    /// </summary>
+    /// <returns>The covered and static mutants, or null when the test timed out or the host did not answer.</returns>
+    private async Task<(IReadOnlyList<int> Covered, IReadOnlyList<int> StaticMutants)?> RunTestAndRelayCoverageAsync(
+        AssemblyTestServer server, string assembly, TestNode test, string testId)
+    {
+        var (updates, timedOut) = await server.RunTestsAsync(new[] { test }, CalculateSingleTestTimeout(test)).ConfigureAwait(false);
+        if (timedOut)
+        {
+            _logger.LogWarning(
+                "{RunnerId}: Test run timed out while capturing per-test coverage for {TestId}; marking as Dubious",
+                RunnerId, testId);
+            await DiscardServerAsync(assembly).ConfigureAwait(false);
+            return null;
+        }
+
+        RecordFailureDuringCoverage(updates, test, testId);
+
+        var epochFilePath = GetPerTestEpochFilePath(assembly);
+        int epoch;
+        lock (_serverLock)
+        {
+            _perTestEpochCounters.TryGetValue(assembly, out var current);
+            epoch = current + 1;
+            _perTestEpochCounters[assembly] = epoch;
+        }
+
+        var requestedRelays = BroadcastEpochRequest(epochFilePath, epoch);
+
+        var acked = await WaitForAllEpochAcksAsync(requestedRelays, epoch, TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+        if (!acked)
+        {
+            _logger.LogWarning(
+                "{RunnerId}: Timed out waiting for coverage relay ack for test {TestId}; marking as Dubious",
+                RunnerId, testId);
+            return null;
+        }
+
+        return ReadCoverageForHandedOutPath(GetPerTestCoverageFilePath(assembly));
+    }
+
+    /// <summary>
+    /// Runs a test a second time when it is the first on its host to cover a mutant, to find the mutants it covers
+    /// once per process only. See <see cref="OncePerProcessCoverage"/>.
+    /// </summary>
+    private async Task FindCoverageThatDependsOnTheHostAsync(
+        AssemblyTestServer server, string assembly, TestNode test, string testId, IReadOnlyList<int> covered)
+    {
+        var coverage = OncePerProcessCoverageOf(assembly);
+        var firstSeen = coverage.FirstSeenOn(server, covered);
+        if (firstSeen.Count == 0)
+        {
+            return;
+        }
+
+        IReadOnlyList<int>? coveredAgain = null;
+        try
+        {
+            coveredAgain = (await RunTestAndRelayCoverageAsync(server, assembly, test, testId).ConfigureAwait(false))?.Covered;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "{RunnerId}: The second run of {TestId} failed; discarding crashed server", RunnerId, testId);
+            await DiscardServerAsync(assembly).ConfigureAwait(false);
+        }
+
+        coverage.Repeated(firstSeen, coveredAgain);
+    }
+
+    private void RecordFailureDuringCoverage(IEnumerable<TestNodeUpdate> updates, TestNode test, string testId)
+    {
+        if (updates.Any(update => update.Node.Uid == test.Uid && TestNodeStates.IsFailure(update.Node.ExecutionState)))
+        {
+            RecordTestFailedDuringCoverage(testId);
+        }
     }
 
     /// <summary>
@@ -755,7 +862,7 @@ public class MicrosoftTestingPlatformRunner : IDisposable
             }
 
             var server = await GetOrCreateServerAsync(assembly).ConfigureAwait(false);
-            var (_, timedOut) = await server.RunTestsAsync(new[] { test }, CalculateSingleTestTimeout(test)).ConfigureAwait(false);
+            var (updates, timedOut) = await server.RunTestsAsync(new[] { test }, CalculateSingleTestTimeout(test)).ConfigureAwait(false);
             if (timedOut)
             {
                 _logger.LogWarning(
@@ -765,6 +872,8 @@ public class MicrosoftTestingPlatformRunner : IDisposable
                 return CoverageRunResult.Create(testId, CoverageConfidence.Dubious,
                     Array.Empty<int>(), Array.Empty<int>(), Array.Empty<int>());
             }
+
+            RecordFailureDuringCoverage(updates, test, testId);
 
             // Stop gracefully (not force) so the injected MutantControl's ProcessExit handler flushes
             // this test's (and only this test's) coverage to file before the process goes away.
@@ -907,34 +1016,18 @@ public class MicrosoftTestingPlatformRunner : IDisposable
         }
     }
 
-    internal TimeSpan? CalculateAssemblyTimeout(List<TestNode> discoveredTests, ITimeoutValueCalculator timeoutCalc, string assembly, IReadOnlyList<IMutant>? mutants = null)
+    internal TimeSpan? CalculateAssemblyTimeout(List<TestNode> discoveredTests, ITimeoutValueCalculator timeoutCalc, string assembly)
     {
-        // Estimates the run time of a set of tests based on their initial (unmutated) run time.
-        int EstimateTime(IEnumerable<TestNode> tests) => (int)tests.Sum(t =>
-        {
-            lock (_discoveryLock)
-            {
-                return _testDescriptions.TryGetValue(t.Uid, out var desc)
-                    ? desc.InitialRunTime.TotalMilliseconds
-                    : 0;
-            }
-        });
-
+        // The budget is the time the whole assembly took in the initial run, whichever tests this run holds.
+        // A mutant runs on a test host of its own, which pays again for what the tests share: the host starting,
+        // and every fixture or application the tests build once per process. A test's initial run time is its
+        // share of the whole run, so the sum over the tests of a run leaves most of that cost out, and the run
+        // would time out with nothing wrong. A timeout counts as a detected mutant, so it must not be an artifact.
         int estimatedTimeMs;
-        // When no mutants are known, or any mutant must be assessed by every test, base the timeout
-        // on the full test run. Otherwise base it only on the tests covering the mutant(s) in this
-        // run. Mutants are grouped so their covering tests are disjoint, so the union of those tests
-        // is exactly what this run needs to execute.
-        if (mutants is null || mutants.Count == 0 || mutants.Any(m => m.AssessingTests.IsEveryTest))
+        lock (_discoveryLock)
         {
-            estimatedTimeMs = EstimateTime(discoveredTests);
-        }
-        else
-        {
-            var assessingTests = mutants
-                .SelectMany(m => m.AssessingTests.GetIdentifiers())
-                .ToHashSet();
-            estimatedTimeMs = EstimateTime(discoveredTests.Where(t => assessingTests.Contains(t.Uid)));
+            estimatedTimeMs = (int)discoveredTests.Sum(t =>
+                _testDescriptions.TryGetValue(t.Uid, out var desc) ? desc.InitialRunTime.TotalMilliseconds : 0);
         }
 
         var timeoutMs = timeoutCalc.CalculateTimeoutValue(estimatedTimeMs);
@@ -1128,7 +1221,7 @@ public class MicrosoftTestingPlatformRunner : IDisposable
             }
 
             var executedTests = accumulator.BuildExecutedTests();
-            var failedTestIds = accumulator.BuildFailedTests();
+            var failedTestIds = WithoutTestsFailingWithoutMutation(accumulator.BuildFailedTests(), mutants);
             var timedOutTestIds = accumulator.BuildTimedOutTests();
 
             IEnumerable<MtpTestDescription> testDescriptionValues;
@@ -1186,6 +1279,11 @@ public class MicrosoftTestingPlatformRunner : IDisposable
         }
     }
 
+    private ITestIdentifiers WithoutTestsFailingWithoutMutation(ITestIdentifiers failedTests, IReadOnlyList<IMutant>? mutants) =>
+        mutants is null || _testsFailingWithoutMutation.Count == 0
+            ? failedTests
+            : new TestIdentifierList(failedTests.GetIdentifiers().Where(test => !_testsFailingWithoutMutation.Contains(test)));
+
     internal virtual async Task<(TestRunResult? Result, bool TimedOut, List<TestNode>? DiscoveredTests)> RunAssemblyTestsAsync(
         string assembly,
         ITimeoutValueCalculator? timeoutCalc,
@@ -1211,18 +1309,79 @@ public class MicrosoftTestingPlatformRunner : IDisposable
         TimeSpan? timeout = null;
         if (timeoutCalc is not null && discoveredTests is not null)
         {
-            timeout = CalculateAssemblyTimeout(discoveredTests, timeoutCalc, assembly, mutants);
+            timeout = CalculateAssemblyTimeout(discoveredTests, timeoutCalc, assembly);
         }
 
-        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, testUidFilter, timeout).ConfigureAwait(false);
+        var (testResults, timedOut) = await RunAssemblyTestsInternalAsync(assembly, testUidFilter, timeout, onFreshHost: mutants is not null).ConfigureAwait(false);
 
         return (testResults as TestRunResult, timedOut, discoveredTests);
     }
 
+    /// <summary>
+    /// Runs the given tests of an assembly on a fresh test host with no mutation active, and gives the ones that
+    /// do not pass there. A mutant is tested on such a host, so these tests would fail whatever the mutant.
+    /// </summary>
+    /// <returns>The tests that failed or did not run to the end. All of them when the host itself failed.</returns>
+    internal virtual async Task<IReadOnlyCollection<string>> FindTestsFailingOnFreshHostAsync(string assembly, IReadOnlySet<string> tests)
+    {
+        WriteMutantIdToFile(-1);
+        TimeSpan initialRunOfAssembly;
+        lock (_discoveryLock)
+        {
+            initialRunOfAssembly = TimeSpan.FromTicks((GetDiscoveredTests(assembly) ?? [])
+                .Sum(test => _testDescriptions.TryGetValue(test.Uid, out var description) ? description.InitialRunTime.Ticks : 0));
+        }
+
+        // as for a mutant, the budget is the whole assembly's: the fresh host pays again for what the tests share
+        var timeout = (initialRunOfAssembly * SingleTestCoverageTimeoutRatio) + _minimumSingleTestCoverageTimeout;
+        var (result, timedOut) = await RunAssemblyTestsInternalAsync(
+            assembly, test => tests.Contains(test.Uid), timeout, onFreshHost: true).ConfigureAwait(false);
+        if (timedOut || result.FailingTests.IsEveryTest)
+        {
+            return tests;
+        }
+
+        var failed = result.FailingTests.GetIdentifiers().ToHashSet();
+        var ran = result.ExecutedTests.IsEveryTest ? tests : result.ExecutedTests.GetIdentifiers().ToHashSet();
+        return tests.Where(test => failed.Contains(test) || !ran.Contains(test)).ToList();
+    }
+
+    /// <summary>
+    /// Runs the tests of an assembly, on a test host of its own when a mutant is under test.
+    /// </summary>
+    /// <remarks>
+    /// A host that ran tests before carries their state, and a mutant can not be judged on it. Code that runs once
+    /// per process, such as the start of an application a test library caches, ran before the mutant became active,
+    /// so a mutant in that code would change nothing and survive. A mutant that breaks such code leaves the broken
+    /// state behind, and the mutants tested after it on the same host would all be killed by it.
+    /// </remarks>
     internal async Task<(ITestRunResult Result, bool TimedOut)> RunAssemblyTestsInternalAsync(
         string assembly,
         Func<TestNode, bool>? testUidFilter,
-        TimeSpan? timeout = null)
+        TimeSpan? timeout = null,
+        bool onFreshHost = false)
+    {
+        if (!onFreshHost)
+        {
+            return await RunAssemblyTestsOnHostAsync(assembly, testUidFilter, timeout).ConfigureAwait(false);
+        }
+
+        await DiscardServerAsync(assembly).ConfigureAwait(false);
+        try
+        {
+            return await RunAssemblyTestsOnHostAsync(assembly, testUidFilter, timeout).ConfigureAwait(false);
+        }
+        finally
+        {
+            // also ends the tests a timed out run left behind
+            await DiscardServerAsync(assembly).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<(ITestRunResult Result, bool TimedOut)> RunAssemblyTestsOnHostAsync(
+        string assembly,
+        Func<TestNode, bool>? testUidFilter,
+        TimeSpan? timeout)
     {
         // A crashed test host tears down the RPC connection, so the run throws (rather than timing out).
         // Retry once on a freshly started server: a crash caused by a *previous* mutant then self-heals

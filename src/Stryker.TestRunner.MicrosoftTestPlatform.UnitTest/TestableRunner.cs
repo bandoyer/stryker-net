@@ -11,6 +11,7 @@ internal class TestableRunner : MicrosoftTestingPlatformRunner
     private readonly Action _onDispose;
     private readonly Func<string, TestNode, string, Task<ICoverageRunResult>>? _coverageHandler;
     private readonly Func<string, TestNode, string, Task<ICoverageRunResult>>? _isolatedCoverageHandler;
+    private readonly Func<IReadOnlySet<string>, IReadOnlyCollection<string>>? _failingOnFreshHost;
 
     public TestableRunner(int id, Action onDispose)
         : base(id, new Dictionary<string, List<TestNode>>(),
@@ -30,13 +31,21 @@ internal class TestableRunner : MicrosoftTestingPlatformRunner
         object discoveryLock,
         Action onDispose,
         Func<string, TestNode, string, Task<ICoverageRunResult>>? coverageHandler = null,
-        Func<string, TestNode, string, Task<ICoverageRunResult>>? isolatedCoverageHandler = null)
+        Func<string, TestNode, string, Task<ICoverageRunResult>>? isolatedCoverageHandler = null,
+        Func<IReadOnlySet<string>, IReadOnlyCollection<string>>? failingOnFreshHost = null)
         : base(id, testsByAssembly, testDescriptions, testSet, discoveryLock, NullLogger.Instance)
     {
         _onDispose = onDispose;
         _coverageHandler = coverageHandler;
         _isolatedCoverageHandler = isolatedCoverageHandler;
+        _failingOnFreshHost = failingOnFreshHost;
     }
+
+    /// <summary>
+    /// Stands in for running the tests on a fresh host with no mutation active. Every test passes there by default.
+    /// </summary>
+    internal override Task<IReadOnlyCollection<string>> FindTestsFailingOnFreshHostAsync(string assembly, IReadOnlySet<string> tests) =>
+        Task.FromResult<IReadOnlyCollection<string>>(_failingOnFreshHost?.Invoke(tests) ?? []);
 
     internal override async Task<ICoverageRunResult> RunSingleTestForCoverageInReusedProcessAsync(
         string assembly, TestNode test, string testId)

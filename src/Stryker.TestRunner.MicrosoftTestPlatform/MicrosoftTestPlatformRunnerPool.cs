@@ -33,6 +33,7 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
     private readonly object _discoveryLock = new();
     private readonly ISingleRunnerFactory _runnerFactory;
     private readonly IStrykerOptions _options;
+    private IReadOnlySet<string> _testsFailingInitially = new HashSet<string>();
 
     public IEnumerable<MicrosoftTestingPlatformRunner> Runners => _availableRunners;
 
@@ -95,6 +96,7 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
         }
 
         var results = await RunThisAsync(runner => runner.InitialTestAsync(project)).ConfigureAwait(false);
+        _testsFailingInitially = results.FailingTests.GetIdentifiers().ToHashSet();
 
         // reset all test processes after the initial test run
         ResetTestProcesses();
@@ -139,6 +141,8 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
             {
                 _logger.LogWarning("Coverage test run failed: {Message}", testResult.ResultMessage);
             }
+
+            SetAsideTestsFailingWithoutMutation(testResult.FailingTests.GetIdentifiers());
 
             // Reset test processes to trigger coverage file flush (process exit writes coverage)
             ResetTestProcesses();
@@ -200,6 +204,8 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
             runner.SetPerTestCoverageMode(true);
         }
 
+        List<(string Assembly, ICoverageRunResult Coverage)> captured;
+
         try
         {
             var allTests = new List<(string Assembly, TestNode Test, string TestId)>();
@@ -220,19 +226,19 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
             _logger.LogInformation("Capturing per-test coverage for {TestCount} tests across {AssemblyCount} assemblies",
                 allTests.Count, _testsByAssembly.Count);
 
-            var results = new ConcurrentBag<ICoverageRunResult>();
+            var results = new ConcurrentBag<(string Assembly, ICoverageRunResult Coverage)>();
 
             Parallel.ForEach(allTests, new ParallelOptions { MaxDegreeOfParallelism = _countOfRunners }, testInfo =>
             {
                 var result = RunThisAsync(runner =>
                         runner.RunSingleTestForCoverageInReusedProcessAsync(testInfo.Assembly, testInfo.Test, testInfo.TestId))
                     .GetAwaiter().GetResult();
-                results.Add(result);
+                results.Add((testInfo.Assembly, result));
             });
 
             _logger.LogInformation("Per-test coverage capture complete: {TestCount} tests captured", results.Count);
 
-            return results;
+            captured = results.ToList();
         }
         finally
         {
@@ -241,6 +247,9 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
                 runner.SetPerTestCoverageMode(false);
             }
         }
+
+        CreditCoverageOncePerProcessToEveryTest(captured);
+        return SortOutTestsThatFailedOnAWarmHost(captured);
     }
 
     /// <summary>
@@ -291,6 +300,8 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
 
             _logger.LogInformation("Per-test-in-isolation coverage capture complete: {TestCount} tests captured", results.Count);
 
+            SetAsideTestsFailingWithoutMutation(_allRunners.SelectMany(runner => runner.TestsFailedDuringCoverage));
+
             return results;
         }
         finally
@@ -299,6 +310,129 @@ public sealed class MicrosoftTestPlatformRunnerPool : ITestRunner
             {
                 runner.SetCoverageMode(false);
             }
+        }
+    }
+
+    /// <summary>
+    /// Credits the mutants that tests cover once per test host to every test of the assembly, see
+    /// <see cref="OncePerProcessCoverage"/>: any of them may rely on what that code set up.
+    /// </summary>
+    private void CreditCoverageOncePerProcessToEveryTest(IEnumerable<(string Assembly, ICoverageRunResult Coverage)> results)
+    {
+        foreach (var testsOfAssembly in results.GroupBy(result => result.Assembly))
+        {
+            var mutants = _allRunners.SelectMany(runner => runner.MutantsCoveredOncePerProcess(testsOfAssembly.Key)).ToHashSet();
+            if (mutants.Count == 0)
+            {
+                continue;
+            }
+
+            _logger.LogInformation(
+                "{MutantCount} mutants are covered once per test host of {Assembly}. Each will be tested against every test of that assembly.",
+                mutants.Count, Path.GetFileName(testsOfAssembly.Key));
+            foreach (var (_, coverage) in testsOfAssembly)
+            {
+                coverage.Merge(CoverageRunResult.Create(coverage.TestId, coverage.Confidence, mutants, [], []));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Deals with the tests that passed in the initial run and failed while coverage was captured on a test host that
+    /// earlier tests had used. No mutation is active during the capture, so such a test either fails on the mutated
+    /// assembly as built, or passes only on a host in the state the whole test run leaves it in. Mutants are tested
+    /// on a fresh host, so running the tests once on a fresh host with no mutation active tells which it is.
+    /// </summary>
+    /// <returns>The coverage to use, where a test that only fails on a warm host is no longer trusted for coverage.</returns>
+    private List<ICoverageRunResult> SortOutTestsThatFailedOnAWarmHost(List<(string Assembly, ICoverageRunResult Coverage)> captured)
+    {
+        var failedOnWarmHost = _allRunners.SelectMany(runner => runner.TestsFailedDuringCoverage)
+            .Where(test => !_testsFailingInitially.Contains(test)).ToHashSet();
+        if (failedOnWarmHost.Count == 0)
+        {
+            return captured.Select(result => result.Coverage).ToList();
+        }
+
+        var failingOnFreshHost = new HashSet<string>();
+        foreach (var testsOfAssembly in captured.Where(result => failedOnWarmHost.Contains(result.Coverage.TestId)).GroupBy(result => result.Assembly))
+        {
+            var tests = testsOfAssembly.Select(result => result.Coverage.TestId).ToHashSet();
+            failingOnFreshHost.UnionWith(
+                RunThisAsync(runner => runner.FindTestsFailingOnFreshHostAsync(testsOfAssembly.Key, tests)).GetAwaiter().GetResult());
+        }
+
+        SetAsideTestsFailingWithoutMutation(failingOnFreshHost);
+
+        var failedOnWarmHostOnly = failedOnWarmHost.Except(failingOnFreshHost).ToHashSet();
+        if (failedOnWarmHostOnly.Count > 0)
+        {
+            // The run that gave their coverage ended early, so it can not show all they cover. A test with dubious
+            // coverage is run against every mutant, which keeps it able to kill the ones it does cover.
+            _logger.LogInformation(
+                "{TestCount} tests failed while coverage was captured on a reused test host and pass on a fresh one: {Examples}. " +
+                "Their coverage can not be trusted, so they will be run against every mutant.",
+                failedOnWarmHostOnly.Count, string.Join(", ", NamesOf(failedOnWarmHostOnly)));
+        }
+
+        return captured.Select(result => failedOnWarmHostOnly.Contains(result.Coverage.TestId)
+            ? WithDubiousConfidence(result.Coverage)
+            : result.Coverage).ToList();
+    }
+
+    private static ICoverageRunResult WithDubiousConfidence(ICoverageRunResult coverage) =>
+        CoverageRunResult.Create(
+            coverage.TestId,
+            CoverageConfidence.Dubious,
+            coverage.MutationsCovered,
+            coverage.MutationsCovered.Where(mutant => coverage[mutant].HasFlag(MutationTestingRequirements.Static)),
+            []);
+
+    private List<string> NamesOf(IEnumerable<string> tests)
+    {
+        lock (_discoveryLock)
+        {
+            return tests.Order().Take(5)
+                .Select(test => _testDescriptions.TryGetValue(test, out var description) ? description.Description.Name : test)
+                .ToList();
+        }
+    }
+
+    /// <summary>
+    /// Stops the tests that fail on a fresh test host with no mutation active from killing mutants. Their failure
+    /// says nothing about a mutant.
+    /// </summary>
+    /// <exception cref="GeneralStrykerException">More than half of the tests fail that way. The mutated assembly
+    /// does not behave like the original then, and every result would be wrong.</exception>
+    private void SetAsideTestsFailingWithoutMutation(IEnumerable<string> failedWithoutMutation)
+    {
+        var failing = failedWithoutMutation.Where(test => !_testsFailingInitially.Contains(test)).ToHashSet();
+        if (failing.Count == 0)
+        {
+            return;
+        }
+
+        var examples = NamesOf(failing);
+        int testCount;
+        lock (_discoveryLock)
+        {
+            testCount = _testDescriptions.Count;
+        }
+
+        if (failing.Count * 2 > testCount)
+        {
+            throw new GeneralStrykerException(
+                $"{failing.Count} of {testCount} tests pass on the original assembly and fail on the mutated one with no mutation active, " +
+                $"for example {string.Join(", ", examples)}. The mutated assembly does not behave like the original, so no mutant can be judged. " +
+                "Run with --verbosity debug to see why the tests fail.");
+        }
+
+        _logger.LogWarning(
+            "{FailingCount} tests passed in the initial test run and fail on the mutated assembly with no mutation active: {Examples}. " +
+            "They can not kill a mutant, so a mutant only they cover will survive.",
+            failing.Count, string.Join(", ", examples));
+        foreach (var runner in _allRunners)
+        {
+            runner.IgnoreFailuresOf(failing);
         }
     }
 
