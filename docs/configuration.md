@@ -458,6 +458,16 @@ Stryker again without coverage analysis and report an issue if this mutant is ki
 are run against all tests as Stryker cannot reliably capture coverage for those. This is a consequence of static
 constructors/initializers being called only once during tests. This heuristic is not needed when using
 `perTestInIsolation` due to tests being run one by one.
+* With the `mtp` test runner, each mutant is tested on a test host process of its own, so a mutant can not affect
+the result of the next one.
+* With the `mtp` test runner in `perTest` mode, Stryker also finds the mutants in code that runs once per test host,
+such as the start of an application that the tests share for the life of the process. The first test to reach that
+code is the only one that runs it, and the other tests rely on what it set up. Each of these mutants is tested against
+every test of that test assembly, which takes longer than testing a mutant against the tests that run its code.
+* With the `mtp` test runner in `perTest` mode, a test that passes in the initial test run and fails while coverage is
+captured is run once more, on a fresh test host with no mutation active. A test that passes there is run against every
+mutant, because the failed run can not show all it covers. A test that fails there too can not kill a mutant. Stryker
+stops when more than half of the tests fail that way: the mutated assembly does not behave like the original then.
 
 ### `disable-bail` &lt;`flag`&gt;
 
